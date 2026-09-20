@@ -205,8 +205,16 @@ def lookaheadPolicy(
     raise NotImplementedError
 
 # The optimal dispatcher is intentionally exhaustive rather than
-# heuristic.  It searches the complete binary decision tree once, then
+# heuristic. It searches the complete binary decision tree once, then
 # replays the best decision sequence on the real simulation.
+#
+# Two optimisations keep that exhaustive search as small as possible:
+#   1. branch-and-bound: as soon as the weighted delay of trains which
+#      have ALREADY finished cannot beat the best complete solution, the
+#      branch is abandoned. Future trains can only add non-negative cost.
+#   2. multiprocessing: a shallow frontier of independent subtrees is
+#      built, then those subtrees are searched by separate processes so
+#      multiple CPU cores can work at the same time.
 #
 # These are module-level on purpose: optimalSearch() is called by
 # simulator.py as an ordinary dispatch policy, so the policy needs to
@@ -216,6 +224,11 @@ _optimalDispatchOrder = None
 _optimalDispatchIndex = 0
 _optimalScenario = None
 
+# Set only inside multiprocessing workers. The Value is shared between
+# processes, so a better result found by one worker immediately becomes a
+# pruning bound for the others as well.
+_workerSharedBestScore = None
+
 
 class _NeedMoreDispatchDecisions(Exception):
     """Internal signal used to stop a test simulation at a tree node."""
@@ -224,30 +237,63 @@ class _NeedMoreDispatchDecisions(Exception):
 
 def _optimalScore(state: SimulationState) -> float:
     """Return the final weighted lateness score for a completed simulation."""
-    score = 0.0
-    for trainState in state.trainStates.values():
-        score += trainState.train.priorityWeight * trainState.lastArrivalDelay
-    return score
+    return sum(
+        trainState.train.priorityWeight * trainState.lastArrivalDelay
+        for trainState in state.trainStates.values()
+    )
 
 
-def _runOptimalBranch(initialState: SimulationState, decisionOrder):
+def _finishedWeightedDelay(state: SimulationState) -> float:
+    """Return the O(1) running lower bound maintained by simulator.py."""
+    return state.finishedWeightedDelay
+
+
+def _currentBestScore(localBestResult) -> float:
+    """Return the tightest pruning bound currently known to this process."""
+    bestScore = localBestResult[0]
+    if _workerSharedBestScore is not None:
+        bestScore = min(bestScore, _workerSharedBestScore.value)
+    return bestScore
+
+
+def _publishBestScore(score: float) -> None:
+    """Publish a new incumbent score to the other worker processes."""
+    if _workerSharedBestScore is None:
+        return
+
+    # multiprocessing.Value supplies a process-safe lock. Re-check while
+    # holding it so two workers finishing at almost the same time cannot
+    # overwrite a better result with a worse one.
+    with _workerSharedBestScore.get_lock():
+        if score < _workerSharedBestScore.value:
+            _workerSharedBestScore.value = score
+
+
+def _runOptimalBranch(initialState: SimulationState, decisionOrder, bestScore=float("inf")):
     """
     Replay one proposed dispatch sequence from the true starting state.
 
     The branch stops as soon as it encounters a policy decision which is
-    not yet present in decisionOrder.  This gives the DFS a new binary
-    tree node to expand without having to duplicate any of the simulator's
-    movement/block/platform rules here.
+    not yet present in decisionOrder. This gives the DFS a new binary tree
+    node to expand without duplicating any simulator movement/block/platform
+    rules here.
+
+    It also stops immediately when the weighted delay of trains which have
+    already finished is >= bestScore. That partial score is a valid lower
+    bound because unfinished trains can only add non-negative delay.
 
     Returns:
-        (completedState, None) if the whole simulation finished, or
-        (None, nextDecisionIndex) if another decision is required.
+        ("complete", completedState) if the whole simulation finished,
+        ("node", nextDecisionIndex) if another decision is required,
+        ("pruned", None) if branch-and-bound proves it cannot improve,
+        ("deadlock", None) if the simulation fails to finish.
     """
     from simulator import simulate
     from copy import deepcopy
 
     testState = deepcopy(initialState)
     decisionIndex = 0
+    wasPruned = False
 
     def branchPolicy(activeTrain, followingTrain, state):
         nonlocal decisionIndex
@@ -259,39 +305,60 @@ def _runOptimalBranch(initialState: SimulationState, decisionOrder):
         decisionIndex += 1
         return decision
 
+    def shouldPrune(state):
+        nonlocal wasPruned
+
+        # Keep the worker's shared bound live: if another core finds a better
+        # complete result while this simulation is running, this branch can use
+        # the tighter bound on its very next tick.
+        liveBestScore = bestScore
+        if _workerSharedBestScore is not None:
+            liveBestScore = min(liveBestScore, _workerSharedBestScore.value)
+
+        if _finishedWeightedDelay(state) >= liveBestScore:
+            wasPruned = True
+            return True
+        return False
+
     try:
         simulate(
             testState,
             dispatchPolicy=branchPolicy,
             verbose=False,
+            abortCondition=shouldPrune,
         )
     except _NeedMoreDispatchDecisions:
-        return None, decisionIndex
+        return "node", decisionIndex
+
+    if wasPruned:
+        return "pruned", None
 
     if not all(trainState.status == "finished" for trainState in testState.trainStates.values()):
-        # This branch did not produce a complete simulation. Treat it as
-        # invalid rather than letting one deadlocked branch prevent the
-        # solver from examining the remaining branches.
         return "deadlock", None
 
-    return testState, None
+    return "complete", testState
 
 
 def _searchOptimal(initialState: SimulationState, decisionOrder, bestResult):
-    """Depth-first exhaustive search of every dispatch decision sequence."""
-    completedState, nextDecisionIndex = _runOptimalBranch(initialState, decisionOrder)
+    """Depth-first exhaustive search below one decision-tree node."""
+    status, result = _runOptimalBranch(
+        initialState,
+        decisionOrder,
+        bestScore=_currentBestScore(bestResult),
+    )
 
-    if completedState == "deadlock":
+    if status in ("deadlock", "pruned"):
         return
 
-    if completedState is not None:
-        score = _optimalScore(completedState)
+    if status == "complete":
+        score = _optimalScore(result)
         if score < bestResult[0]:
             bestResult[0] = score
             bestResult[1] = decisionOrder.copy()
+            _publishBestScore(score)
         return
 
-    # Both decisions are legal at this point.  Search GO first, then WAIT.
+    # Both decisions are legal at this point. Search GO first, then WAIT.
     # No tree-node objects are needed: decisionOrder itself is the DFS path.
     decisionOrder.append(True)
     _searchOptimal(initialState, decisionOrder, bestResult)
@@ -302,37 +369,169 @@ def _searchOptimal(initialState: SimulationState, decisionOrder, bestResult):
     decisionOrder.pop()
 
 
+def _findFirstCompleteSolution(initialState: SimulationState):
+    """
+    Find one complete solution quickly to seed branch-and-bound.
+
+    This is not the optimisation search itself; it simply follows the same
+    GO-first DFS until the first completed leaf. Having a finite score before
+    parallel search starts means every worker can prune immediately.
+    """
+    decisionOrder = []
+
+    def find():
+        status, result = _runOptimalBranch(initialState, decisionOrder)
+
+        if status == "complete":
+            return _optimalScore(result), decisionOrder.copy()
+        if status in ("deadlock", "pruned"):
+            return None
+
+        decisionOrder.append(True)
+        found = find()
+        decisionOrder.pop()
+        if found is not None:
+            return found
+
+        decisionOrder.append(False)
+        found = find()
+        decisionOrder.pop()
+        return found
+
+    return find()
+
+
+def _buildParallelFrontier(initialState: SimulationState, targetSubtrees: int, bestScore: float):
+    """
+    Build a shallow set of real decision-tree nodes to distribute to workers.
+
+    Expanding actual nodes rather than blindly generating bit strings avoids
+    creating meaningless prefixes when a scenario finishes after fewer
+    decisions than the requested split depth.
+    """
+    frontier = [[]]
+
+    while len(frontier) < targetSubtrees:
+        expandedAnything = False
+        nextFrontier = []
+
+        for prefix in frontier:
+            status, _ = _runOptimalBranch(initialState, prefix, bestScore=bestScore)
+
+            if status == "node":
+                nextFrontier.append(prefix + [True])
+                nextFrontier.append(prefix + [False])
+                expandedAnything = True
+            elif status == "complete":
+                # The initial solution already gives us a complete incumbent.
+                # A complete prefix at this stage has no subtree left to search.
+                continue
+            # deadlocked/pruned prefixes are discarded.
+
+        if not expandedAnything:
+            break
+
+        frontier = nextFrontier
+        if not frontier:
+            break
+
+    return frontier
+
+
+def _initialiseOptimalWorker(sharedBestScore):
+    """ProcessPool initializer: attach this worker to the shared incumbent."""
+    global _workerSharedBestScore
+    _workerSharedBestScore = sharedBestScore
+
+
+def _searchOptimalSubtree(initialState: SimulationState, prefix, initialBestScore: float):
+    """Worker entry point: search one independent subtree."""
+    bestResult = [initialBestScore, None]
+    _searchOptimal(initialState, prefix.copy(), bestResult)
+    return bestResult[0], bestResult[1]
+
+
+def _searchOptimalParallel(initialState: SimulationState):
+    """Search the exhaustive decision tree across all available CPU cores."""
+    import os
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    firstSolution = _findFirstCompleteSolution(initialState)
+    if firstSolution is None:
+        return [float("inf"), None]
+
+    initialBestScore, initialBestOrder = firstSolution
+    bestResult = [initialBestScore, initialBestOrder]
+
+    cpuCount = max(1, os.cpu_count() or 1)
+
+    # Process startup/pickling costs more than it saves on tiny search trees.
+    # The first complete path gives a cheap estimate of tree depth, so keep
+    # small scenarios serial and reserve multiprocessing for genuinely larger
+    # searches. The exhaustive algorithm and result are unchanged either way.
+    minimumParallelDepth = 8
+    if cpuCount == 1 or len(initialBestOrder) < minimumParallelDepth:
+        _searchOptimal(initialState, [], bestResult)
+        return bestResult
+
+    targetSubtrees = max(2, cpuCount * 2)
+    frontier = _buildParallelFrontier(initialState, targetSubtrees, initialBestScore)
+
+    if len(frontier) <= 1:
+        _searchOptimal(initialState, [], bestResult)
+        return bestResult
+
+    workerCount = min(cpuCount, len(frontier))
+
+    # Use the platform's default multiprocessing context. On Windows this is
+    # spawn; on Linux it is normally fork. multiprocessing.Value is shared
+    # memory, so workers can cheaply see a better score found by another core.
+    context = multiprocessing.get_context()
+    sharedBestScore = context.Value("d", initialBestScore, lock=True)
+
+    with ProcessPoolExecutor(
+        max_workers=workerCount,
+        mp_context=context,
+        initializer=_initialiseOptimalWorker,
+        initargs=(sharedBestScore,),
+    ) as executor:
+        futures = [
+            executor.submit(_searchOptimalSubtree, initialState, prefix, initialBestScore)
+            for prefix in frontier
+        ]
+
+        for future in as_completed(futures):
+            score, order = future.result()
+            if order is not None and score < bestResult[0]:
+                bestResult[0] = score
+                bestResult[1] = order
+
+    return bestResult
+
+
 def optimalSearch(activeTrain: Train, followingTrain: Optional[Train], state: SimulationState) -> bool:
     """
     Exhaustively search all legal dispatch/wait decisions once for the
     current scenario, then replay the lowest-score decision order.
 
-    This function deliberately has the same signature as the other
-    dispatch policies because simulator.py calls it as a policy.  On the
-    first call for a scenario it reconstructs the true starting state and
-    searches from t=0; after that, calls simply consume the stored bool
-    sequence one item at a time.
+    The search uses branch-and-bound pruning plus multiprocessing, but the
+    result is still exhaustive: a branch is pruned only when its already-fixed
+    cost is at least the best complete score, so it cannot contain a better
+    solution.
     """
     global _optimalDispatchOrder, _optimalDispatchIndex, _optimalScenario
 
-    # A new scenario needs a new solution.  For the same scenario, the
-    # expensive search is performed only once.
     if _optimalScenario is not state.scenario:
         _optimalScenario = state.scenario
         _optimalDispatchOrder = None
         _optimalDispatchIndex = 0
 
-    # Solve only the first time this scenario reaches a real dispatch
-    # decision.  The state passed into this call may already have had an
-    # earlier train processed during the same simulation tick, so rebuild
-    # the exact starting state from the immutable Scenario.
     if _optimalDispatchOrder is None:
         from scenario_input import createSimulationState
 
         initialState = createSimulationState(state.scenario)
-        bestResult = [float("inf"), None]
-
-        _searchOptimal(initialState, [], bestResult)
+        bestResult = _searchOptimalParallel(initialState)
 
         if bestResult[1] is None:
             raise RuntimeError("optimalSearch could not find a completed dispatch sequence.")
