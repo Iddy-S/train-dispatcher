@@ -1,9 +1,9 @@
 """
 scenario_input.py
 
-Everything to do with getting data FROM the user and turning it INTO
+Everything to do with getting data from the user and turning it into
 entities.py objects. Kept separate from entities.py (which only
-defines what a Station/Train/Scenario *is*, not how one gets built
+defines what a Station/Train/Scenario is, not how one gets built
 from input), and separate from display.py (which goes the other way -
 objects to text).
 """
