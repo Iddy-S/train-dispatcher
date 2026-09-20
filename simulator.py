@@ -132,6 +132,7 @@ class SimulationState:
     blockOccupancy: Dict[BlockId, str] = field(default_factory=dict)       # blockId -> headcode occupying it
     platformOccupancy: Dict[str, List[str]] = field(default_factory=dict)  # station name -> headcodes there
     currentTimeSeconds: float = 0.0  # kept in sync by simulate() every tick - lets a dispatch policy (like greedyPolicy) see "now" without it being threaded through as an explicit argument everywhere
+    finishedWeightedDelay: float = 0.0  # running objective contribution from trains whose journeys are already complete; used by optimal branch-and-bound
 
 
 def _printBoard(state: SimulationState, verbose: bool) -> None:
@@ -623,7 +624,15 @@ def _advanceTrain(headcode: str, state: SimulationState, currentTimeSeconds: int
             if verbose:
                 print(f"t={currentTimeSeconds}s: {headcode} reaches {nextStation.name} (not a scheduled stop)")
 
-        trainState.status = "finished" if isFinalStation else "at_station"
+        if isFinalStation:
+            trainState.status = "finished"
+            # This value is now permanent: the train has reached the final
+            # station, so its contribution to the objective cannot change.
+            # Keeping the running total here makes optimal-search pruning O(1).
+            state.finishedWeightedDelay += train.priorityWeight * trainState.lastArrivalDelay
+        else:
+            trainState.status = "at_station"
+
         trainState.currentStationIndex = nextStationIndex
         trainState.currentSectionIndex = None
         trainState.currentBlockIndex = None
@@ -632,12 +641,23 @@ def _advanceTrain(headcode: str, state: SimulationState, currentTimeSeconds: int
         _printBoard(state, verbose)
 
 
-def simulate(simulationState: SimulationState, dispatchPolicy=None, maxSeconds: int = 100_000, verbose: bool = True) -> SimulationState:
+def simulate(
+    simulationState: SimulationState,
+    dispatchPolicy=None,
+    maxSeconds: int = 100_000,
+    verbose: bool = True,
+    abortCondition=None,
+) -> SimulationState:
     """
     Run the simulation one second at a time, mutating and returning the
     SimulationState you pass in, until every train has finished or
     maxSeconds is reached (a safety net in case two trains end up
     deadlocked, blocking each other forever).
+
+    abortCondition is an optional internal optimisation hook. If supplied,
+    it is called after each tick and the simulation stops early when it
+    returns True. Normal dispatchers leave it as None. The optimal search
+    uses it for branch-and-bound pruning.
 
     dispatchPolicy defaults to dispatch_policies.manualPolicy, imported
     lazily here (see the module docstring for why it can't be a normal
@@ -665,6 +685,9 @@ def simulate(simulationState: SimulationState, dispatchPolicy=None, maxSeconds: 
             _advanceTrain(train.headcode, state, currentTimeSeconds, verbose)
 
         _refreshHeldTrains(state)
+
+        if abortCondition is not None and abortCondition(state):
+            break
 
         currentTimeSeconds += 1
     else:
