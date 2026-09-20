@@ -9,24 +9,14 @@ strategy:
   2. A train can never leave a station before its scheduled departure
      time for that stop.
 
-Whenever a train COULD depart (its time has come, and the next block
+Whenever a train can depart (its time has come, and the next block
 is free) but there's a genuine choice about whether it's tactically
 worth waiting, that choice is delegated to a "dispatch policy"
 function - see dispatch_policies.py. manualPolicy there just asks you
 directly; swap it for greedyPolicy once that's written, by passing it
 as simulate()'s dispatchPolicy argument.
 
-CIRCULAR IMPORT NOTE: dispatch_policies.py imports SimulationState from
-this file. So this file can't import dispatch_policies.py at the TOP
-(that would be a loop: simulator -> dispatch_policies -> simulator,
-with neither finishing loading first). Instead, simulate() imports
-manualPolicy lazily, INSIDE the function body, only if no policy was
-given - by the time simulate() actually runs, both modules have
-already finished loading, so the cycle never causes a problem. Same
-trick is used to call into display.py for board snapshots, since
-display.py also imports from this file.
-
-MODELLING ASSUMPTIONS (flag if any of these aren't what you intended):
+Modelling Simplifications:
 - Each Section splits into (numSignals + 1) equal-length blocks.
 - Trains are treated as point-sized - a train occupies exactly one
   block at a time, never overlaps two.
@@ -57,7 +47,7 @@ MODELLING ASSUMPTIONS (flag if any of these aren't what you intended):
   only ever cleared by _refreshHeldTrains, called once per tick AFTER
   all movement has happened, via two checks (see that function's
   docstring for the full reasoning):
-    1. DEFINITIVE - has this train become the genuine last live train
+    1. Definitive - has this train become the genuine last live train
        (nothing live behind it anywhere, per _findFollowingTrain /
        _othersAtSamePosition, which already exclude held AND finished
        trains)? If so it's un-held immediately, regardless of anything
@@ -66,14 +56,14 @@ MODELLING ASSUMPTIONS (flag if any of these aren't what you intended):
        finished train stops being tracked via block/station occupancy
        entirely, so nothing "moves into" a trackable position to
        trigger a movement-based check.
-    2. HEURISTIC (fallback) - has the occupant of the position two
+    2. Heuristic (fallback) - has the occupant of the position two
        steps behind this station changed since it was held (stations
        count as a step, same as a block - see _snapshotTwoBack)? If
        there's no valid "two back" position at all (the train is held
        at the very start of the line), there's nothing to compare
        against, so it stays held via this check specifically - though
        check 1 above can still clear it regardless.
-  This is deliberately EAGER (run for every held train every tick)
+  This is deliberately eager (run for every held train every tick)
   rather than lazy (checked inside _attemptDeparture itself), since
   _attemptDeparture can return early for unrelated reasons (its own
   next block still occupied) without ever reaching a check placed
@@ -114,7 +104,7 @@ class TrainState:
     """Everything about a single train that changes as the simulation
     runs."""
     train: Train
-    status: str = "at_station"                  # "at_station" | "in_transit" | "finished"
+    status: str = "at_station"                   # "at_station" | "in_transit" | "finished"
     currentStationIndex: Optional[int] = 0       # valid when status == "at_station"
     currentSectionIndex: Optional[int] = None    # valid when status == "in_transit"
     currentBlockIndex: Optional[int] = None      # valid when status == "in_transit"
@@ -131,7 +121,7 @@ class SimulationState:
     trainStates: Dict[str, TrainState] = field(default_factory=dict)       # headcode -> TrainState
     blockOccupancy: Dict[BlockId, str] = field(default_factory=dict)       # blockId -> headcode occupying it
     platformOccupancy: Dict[str, List[str]] = field(default_factory=dict)  # station name -> headcodes there
-    currentTimeSeconds: float = 0.0  # kept in sync by simulate() every tick - lets a dispatch policy (like greedyPolicy) see "now" without it being threaded through as an explicit argument everywhere
+    currentTimeSeconds: float = 0.0  # kept in sync by simulate() every tick - lets a dispatch policy see "now" without it being threaded through as an explicit argument everywhere
     finishedWeightedDelay: float = 0.0  # running objective contribution from trains whose journeys are already complete; used by optimal branch-and-bound
 
 
@@ -224,16 +214,15 @@ def _cumulativeDistance(trainState: TrainState, scenario: Scenario) -> float:
 
 def _earliestArrivalAtStation(trainState: TrainState, targetStationIndex: int, fromTimeSeconds: float, scenario: Scenario) -> float:
     """
-    Estimate the earliest time this train could physically REACH
+    Estimate the earliest time this train could physically reach
     targetStationIndex, starting from its current physical position,
     counting from fromTimeSeconds (normally just the current
     simulation time). Properly accounts for the train's OWN scheduled
     stops in between - it can't depart one before its scheduled time,
     even if it arrives early - so this isn't just distance/speed.
 
-    DELIBERATE SIMPLIFICATION (same spirit as the rest of greedyPolicy):
-    assumes clear track from here on - it does NOT model this train
-    getting blocked by some THIRD, unrelated train along the way, and
+    Assumes clear track from here on - it does not model this train
+    getting blocked by some third, unrelated train along the way, and
     ignores the ~1-tick platform-occupancy delay a genuine pass-through
     station adds in the real simulation. Both are judged not to matter
     at the timescales involved here.
@@ -314,9 +303,9 @@ def _remainingTimetableSlack(trainState: TrainState, state: SimulationState, cur
 
 def _findFollowingTrain(headcode: str, state: SimulationState) -> Optional[Train]:
     """
-    The nearest OTHER unfinished, NOT-HELD train with a STRICTLY
+    The nearest other unfinished, not-held train with a strictly
     smaller real distance than this one - i.e. a genuine, unambiguous,
-    LIVE physical follower. Deliberately returns None when other
+    live physical follower. Deliberately returns None when other
     trains are tied at the exact same distance (raw distance can't
     meaningfully rank trains that are literally in the same place -
     that case is handled separately by _othersAtSamePosition, which
@@ -396,11 +385,11 @@ def _snapshotTwoBack(stationIndex: int, state: SimulationState):
 
 def _refreshHeldTrains(state: SimulationState) -> None:
     """
-    Called once per tick, AFTER all movement for that tick has already
+    Called once per tick, after all movement for that tick has already
     happened. For every currently-held train, two separate checks can
     clear isHeld:
 
-    1. DEFINITIVE: has this train become the genuine last live train -
+    1. Definitve: has this train become the genuine last live train -
        i.e. do _findFollowingTrain and _othersAtSamePosition (which
        already exclude held and finished trains) now agree that
        NOTHING live is behind it anywhere? If so, there's no decision
@@ -414,16 +403,16 @@ def _refreshHeldTrains(state: SimulationState) -> None:
        stay stuck forever even after every other train had completed
        its journey and left the line entirely.
 
-    2. HEURISTIC (only checked if 1 didn't already clear it): has
+    2. Heuristic: (only checked if 1 didn't already clear it): has
        whatever occupies the position two steps behind this train's
        station (stations count as a step, same as a block - see
        _snapshotTwoBack) changed since it was held? If there's no valid
        "two back" position at all (the train is held at the very first
        station, where most trains begin), there's nothing to compare
-       against, so it STAYS held via this check specifically - it does
+       against, so it stays held via this check specifically - it does
        NOT get cleared every tick just because there's no reference.
 
-    Doing this HERE - eagerly, driven by movement - rather than lazily
+    Doing this here - eagerly, driven by movement - rather than lazily
     inside _attemptDeparture matters: _attemptDeparture can return
     early for unrelated reasons (e.g. its own next block is still
     occupied) without ever reaching a check placed there, which could
@@ -454,7 +443,7 @@ def _refreshHeldTrains(state: SimulationState) -> None:
 
 def _othersAtSamePosition(headcode: str, state: SimulationState) -> List[Train]:
     """
-    Every OTHER unfinished, NOT-HELD train currently at the EXACT SAME
+    Every other unfinished, not-held train currently at the exact same
     cumulative distance as this one - whether it's literally sitting at
     the same station, or stuck at a block boundary right at that
     station's entrance (which, by construction, is the same distance
