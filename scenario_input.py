@@ -102,7 +102,7 @@ def createSections(stations, trains):
         sections.append(section)
 
     for i in range(len(stations) - 1):
-        sections[i].distance = float(input(f"Enter the distance between {stations[i].name} and {stations[i+1].name}: "))
+        sections[i].distance = float(input(f"Enter the distance between {stations[i].name} and {stations[i+1].name} in miles: "))
         sections[i].numSignals = int(input("Enter the number of signals in this strech: "))
 
         linesToPrint = showScenario(Scenario(line=Line(stations=stations, sections=sections), trains=trains))
@@ -128,7 +128,7 @@ def createTrains(stations, numTrains):
     for train in range(numTrains):
         print(f"Train {train+1}/{numTrains}")
         headcode = _getUniqueHeadcode(usedHeadcodes)
-        speed = float(input("Enter the speed of this train (distance units per hour): ")) / 3600  # stored internally as distance units per second
+        speed = float(input("Enter the speed of this train in miles per hour: ")) / 3600  # stored internally as miles per second
         weight = float(input("Enter the priority wieght of this train: "))
         print()
         if not len(trains):
@@ -168,7 +168,7 @@ def createTrains(stations, numTrains):
                 
 
             while 1:
-                inputTime = input(f"What time will this train be scheduled to depart {departureStation.name}: ")
+                inputTime = input(f"Enter the time at which this train will be scheduled to depart {departureStation.name}: ")
                 validFloat = True
                 for char in inputTime:
                     if char not in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.']:
