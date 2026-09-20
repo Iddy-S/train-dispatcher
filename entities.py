@@ -1,7 +1,7 @@
 """
 entities.py
 
-The STATIC input data for a scenario - the things that don't change
+The static input data for a scenario - the things that don't change
 once you've defined them: what the line looks like, and what trains
 are meant to run on it. Nothing in this file changes as a simulation
 runs; that "changing" data (positions, delays, occupancy) belongs in
