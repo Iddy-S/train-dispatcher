@@ -7,15 +7,7 @@ train should go now or wait. simulator.py calls one of these every
 time a train reaches a departure decision.
 
 Every policy takes the same inputs and returns the same shape of
-output (True = go, False = wait), so simulate() and benchmark.py (once
-it exists) can swap between them without caring which one is running.
-
-CIRCULAR IMPORT NOTE: this file imports SimulationState from
-simulator.py (below), and simulator.py needs manualPolicy from here as
-its default dispatch policy. simulator.py resolves this by importing
-manualPolicy lazily, INSIDE simulate()'s function body rather than at
-the top of the file - see simulator.py's module docstring for the
-full explanation of why that's safe.
+output (True = go, False = wait).
 """
 
 from typing import Optional
@@ -35,9 +27,6 @@ from entities import Train
 def manualPolicy(activeTrain: Train, followingTrain: Optional[Train], state: SimulationState) -> bool:
     """
     Ask the user directly whether the active train should depart now.
-    Same signature as greedyPolicy/lookaheadPolicy below, so swapping
-    it out later is a one-line change to simulate()'s dispatchPolicy
-    argument.
     """
     print(f"  ({followingTrain.headcode} is currently the nearest train behind {activeTrain.headcode})")
 
@@ -51,21 +40,21 @@ def manualPolicy(activeTrain: Train, followingTrain: Optional[Train], state: Sim
 def greedyPolicy(activeTrain: Train, followingTrain: Train, state: SimulationState) -> bool:
     """
     Decide using only the active train and its immediate follower - no
-    lookahead beyond the next station (unlike lookaheadPolicy below).
-    Compares the weighted cost of going now (delay this adds to
-    followingTrain) against the weighted cost of waiting here (delay
-    this adds to activeTrain), and picks whichever is cheaper.
+    lookahead beyond the next station. Compares the weighted cost of 
+    going now (delay this adds to followingTrain) against the weighted 
+    cost of waiting here (delay this adds to activeTrain), and picks 
+    whichever is cheaper.
 
     CONTROL STATION: where the overtake could actually happen. A
     station with only 1 platform can never host one (matches the
     single-platform auto-dispatch rule elsewhere), so this searches
     forward for the next station with >= 2. Two cases:
-      - followingTrain genuinely behind (gap > 0): the search INCLUDES
+      - followingTrain genuinely behind (gap > 0): the search includes
         activeTrain's current station - since dispatch policies are
         never even called from a 1-platform station, the current one
         already qualifies, so this resolves to "here" (holding only
         ever happens at the current station in this engine anyway).
-      - followingTrain exactly TIED with activeTrain (gap == 0 - e.g.
+      - followingTrain exactly tied with activeTrain (gap == 0 - e.g.
         both starting together, the normal starting condition): the
         CURRENT station isn't a meaningful future opportunity for
         either of them - there's nothing left to "arrive" for, since
@@ -73,7 +62,7 @@ def greedyPolicy(activeTrain: Train, followingTrain: Train, state: SimulationSta
         station instead, projecting forward to wherever a genuine
         difference could still emerge.
 
-    KNOWN LIMITATIONS (stated plainly, not glossed over):
+    KNOWN LIMITATIONS:
     - only ever considers the ONE immediate follower passed in, not a
       whole queue of trains that might be backed up behind it
     - doesn't account for cascading effects further down the line -
@@ -102,16 +91,16 @@ def greedyPolicy(activeTrain: Train, followingTrain: Train, state: SimulationSta
 
     activePosition = _cumulativeDistance(activeState, scenario)
     followingPosition = _cumulativeDistance(followingState, scenario)
-    gap = activePosition - followingPosition  # 0 for a genuine tie, never negative - the caller guarantees followingTrain is at or behind activeTrain
+    gap = activePosition - followingPosition
 
     relativeSpeed = followingSpeed - activeSpeed
     catchUpTime = gap / relativeSpeed  # 0 immediately for a tie - they're already "caught up"
 
-    # Bound this first check by when activeTrain's OWN next scheduled
-    # stop actually FREES the shared block - which is arrival if that
+    # Bound this first check by when activeTrain's own next scheduled
+    # stop actually frees the shared block - which is arrival if that
     # stop has >= 2 platforms (the follower can use a different one
     # without needing activeTrain to leave first), but not until
-    # DEPARTURE if it only has 1 (the follower can't get past at all
+    # departure if it only has 1 (the follower can't get past at all
     # while activeTrain still occupies its only platform).
     nextStopIndex = _nextScheduledStopIndex(activeState, scenario)
     nextStopStation = scenario.line.stations[nextStopIndex]
@@ -133,11 +122,7 @@ def greedyPolicy(activeTrain: Train, followingTrain: Train, state: SimulationSta
     controlStationIndex = _nextPassingStationIndex(scenario, activeState.currentStationIndex, inclusive=(gap > 0))
     controlStation = scenario.line.stations[controlStationIndex]
 
-    # STEP 2 - is there currently room for the follower there? Only
-    # meaningful when the follower hasn't already arrived (gap > 0) -
-    # for a tie, controlStation is a genuinely different, future
-    # station neither of our two trains occupies yet, so counting
-    # CURRENT occupancy there wouldn't even involve them.
+    # STEP 2 - is there currently room for the follower there? 
     platformsHere = state.platformOccupancy[controlStation.name]
     if len(platformsHere) >= controlStation.platforms and gap > 0:
         # no room for the follower to overtake here even if activeTrain
@@ -145,26 +130,24 @@ def greedyPolicy(activeTrain: Train, followingTrain: Train, state: SimulationSta
         # platform) - waiting wouldn't create an opportunity, so go
         return True
 
-    # STEP 3 - cost of GOING now: once the follower catches up, it
-    # STOPS COMPLETELY (this engine has no "crawling behind" - a
+    # STEP 3 - cost of going now: once the follower catches up, it
+    # stops completely (this engine has no "crawling behind" - a
     # blocked train parks at the boundary until the block is free, see
     # _advanceTrain) and stays stopped until activeTrain frees the
-    # block. So the delay this causes is simply that stopped duration -
-    # not a distance/speed comparison, since the follower isn't moving
-    # at any reduced speed during it, it's moving at zero.
+    # block.
     blockingDelay = max(freeTime - catchUpAbsoluteTime, 0.0)
 
     followingSlack = _remainingTimetableSlack(followingState, state, currentTimeSeconds)
     additionalFinalDelayToFollowing = max(blockingDelay - followingSlack, 0.0)
     goCost = additionalFinalDelayToFollowing * followingTrain.priorityWeight
 
-    # STEP 4 - cost of WAITING. For a genuine follower (gap > 0), this
+    # STEP 4 - cost of waiting. For a genuine follower (gap > 0), this
     # is how long activeTrain needs to hold for followingTrain to
     # reach and claim a platform at the control station. For an exact
-    # TIE (gap == 0, e.g. both starting together), that arrival-time
-    # comparison is the WRONG model entirely: if activeTrain waits,
+    # tie (gap == 0, e.g. both starting together), that arrival-time
+    # comparison is the wrong model entirely: if activeTrain waits,
     # followingTrain is no longer excluded by isHeld and departs almost
-    # immediately, and activeTrain's OWN hold is released again within
+    # immediately, and activeTrain's own hold is released again within
     # a tick or two once followingTrain is no longer tied with/behind
     # it (see _refreshHeldTrains) - waiting here is essentially FREE,
     # not something to compare against a future station's arrival time.
@@ -184,25 +167,9 @@ def greedyPolicy(activeTrain: Train, followingTrain: Train, state: SimulationSta
     else:
         waitCost = 0.0
 
-    # STEP 5 - compare. An exact tie favours GO (keeps things moving,
-    # avoids indefinite dithering on a knife-edge decision).
+    # STEP 5 - compare. An exact tie favours go.
     return waitCost >= goCost
 
-
-def lookaheadPolicy(
-    activeTrain: Train,
-    followingTrain: Train,
-    state: SimulationState,
-    lookaheadStations: int = 2,
-) -> bool:
-    """
-    Same decision as greedyPolicy, but simulates `lookaheadStations`
-    stations ahead for both the "go" and "wait" branches, and picks
-    whichever gives the better total weighted score over that window.
-
-    Not implemented yet.
-    """
-    raise NotImplementedError
 
 # The optimal dispatcher is intentionally exhaustive rather than
 # heuristic. It searches the complete binary decision tree once, then
@@ -374,7 +341,7 @@ def _findFirstCompleteSolution(initialState: SimulationState):
     Find one complete solution quickly to seed branch-and-bound.
 
     This is not the optimisation search itself; it simply follows the same
-    GO-first DFS until the first completed leaf. Having a finite score before
+    go-first DFS until the first completed leaf. Having a finite score before
     parallel search starts means every worker can prune immediately.
     """
     decisionOrder = []
@@ -559,6 +526,5 @@ def optimalSearch(activeTrain: Train, followingTrain: Optional[Train], state: Si
 POLICIES = {
     "manual": manualPolicy,
     "greedy": greedyPolicy,
-    "lookahead": lookaheadPolicy,
     "optimal": optimalSearch,
 }
